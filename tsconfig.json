@@ -18,6 +18,5 @@
     "resolveJsonModule": true,
     "esModuleInterop": true
   },
-  "include": ["src", "netlify"]
+  "include": ["src", "api"]
 }
-

@@ -19,6 +19,7 @@ export interface WalletRecord {
   id: string;
   telegram_id: number;
   name: string;
+  wallet_type: 'LIQUID' | 'DEBT' | string;
   balance_mmk: number;
   is_credit: boolean;
   sort_order: number;
@@ -28,6 +29,10 @@ export interface TransactionRecord {
   id: string;
   telegram_id: number;
   tx_date: string;
+  item_note?: string;
+  voice_input?: string;
+  category?: string;
+  wallet_name?: string;
   description: string;
   type: 'income' | 'expense' | 'transfer' | 'todo_pay';
   wallet: string;
@@ -40,6 +45,7 @@ export interface TransactionRecord {
 export interface DailySummaryRecord {
   telegram_id: number;
   tx_date: string;
+  total_amount_mmk?: number;
   net_total_mmk: number;
   pure_spent_mmk: number;
   total_income_mmk: number;
@@ -52,6 +58,7 @@ export interface MonthlyTodoRecord {
   title: string;
   target_mmk: number;
   done_mmk: number;
+  month_cycle?: string;
   month_label: string;
   is_archived: boolean;
   created_at: string;
@@ -87,7 +94,6 @@ function generateUUID(): string {
 export function getDefaultNextPayday(): string {
   const todayISO = getMyanmarDateISO(0);
   const [yyyy, mm, dd] = todayISO.split('-').map(Number);
-  // Default to end of current month, or 25th of next month if past 25th
   const lastDayOfMonth = new Date(yyyy, mm, 0).getDate();
   if (dd < lastDayOfMonth) {
     return `${yyyy}-${String(mm).padStart(2, '0')}-${String(lastDayOfMonth).padStart(2, '0')}`;
@@ -103,11 +109,11 @@ export function computeSafeToSpendMetrics(
   nextPaydayISO: string
 ): FinancialContextForAdvice {
   const totalLiquidMmk = wallets
-    .filter((w) => !w.is_credit && w.name !== 'AYA Credit Card')
+    .filter((w) => !w.is_credit && w.wallet_type !== 'DEBT' && w.name !== 'AYA Credit Card')
     .reduce((sum, w) => sum + Number(w.balance_mmk || 0), 0);
 
   const creditCardDebtMmk = wallets
-    .filter((w) => w.is_credit || w.name === 'AYA Credit Card')
+    .filter((w) => w.is_credit || w.wallet_type === 'DEBT' || w.name === 'AYA Credit Card')
     .reduce((sum, w) => sum + Number(w.balance_mmk || 0), 0);
 
   const todayISO = getMyanmarDateISO(0);
@@ -127,6 +133,78 @@ export function computeSafeToSpendMetrics(
 }
 
 // ============================================================================
+// Row Normalizers (maps Supabase `users`, `wallets`, `transactions`, `monthly_todos`, `daily_summary`)
+// ============================================================================
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function normalizeWalletRow(row: any): WalletRecord {
+  const isCredit =
+    row.wallet_type === 'DEBT' ||
+    Boolean(row.is_credit) ||
+    row.name === 'AYA Credit Card';
+  return {
+    id: row.id,
+    telegram_id: Number(row.telegram_id),
+    name: row.name,
+    wallet_type: isCredit ? 'DEBT' : 'LIQUID',
+    balance_mmk: Number(row.balance_mmk || 0),
+    is_credit: isCredit,
+    sort_order: Number(row.sort_order ?? 0),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function normalizeTransactionRow(row: any): TransactionRecord {
+  const cat = String(row.category || '');
+  const amt = Number(row.amount_mmk || 0);
+  let txType: 'income' | 'expense' | 'transfer' | 'todo_pay' = row.type || 'expense';
+  if (!row.type) {
+    if (cat.startsWith('Transfer') || row.transfer_pair_id) {
+      txType = 'transfer';
+    } else if (cat === 'DebtPayoff') {
+      txType = 'todo_pay';
+    } else if (cat === 'Income' || amt > 0) {
+      txType = 'income';
+    } else {
+      txType = 'expense';
+    }
+  }
+
+  return {
+    id: row.id,
+    telegram_id: Number(row.telegram_id),
+    tx_date: row.tx_date,
+    item_note: row.item_note,
+    voice_input: row.voice_input,
+    category: cat,
+    wallet_name: row.wallet_name ?? row.wallet ?? 'Cash',
+    description: row.item_note || row.voice_input || row.description || cat || 'Transaction',
+    type: txType,
+    wallet: row.wallet_name ?? row.wallet ?? 'Cash',
+    amount_mmk: amt,
+    transfer_pair_id: row.transfer_pair_id ?? null,
+    todo_id: row.todo_id ?? null,
+    created_at: row.created_at || new Date().toISOString(),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function normalizeTodoRow(row: any): MonthlyTodoRecord {
+  const cycle = row.month_cycle || row.month_label || getMyanmarDateISO(0).slice(0, 7);
+  return {
+    id: row.id,
+    telegram_id: Number(row.telegram_id),
+    title: row.title,
+    target_mmk: Number(row.target_mmk || 0),
+    done_mmk: Number(row.done_mmk || 0),
+    month_cycle: cycle,
+    month_label: cycle,
+    is_archived: Boolean(row.is_archived),
+    created_at: row.created_at || new Date().toISOString(),
+  };
+}
+
+// ============================================================================
 // LocalStorage Fallback Store (used when Supabase env vars are not set)
 // ============================================================================
 const LOCAL_STORAGE_PREFIX = 'mmk_finance_tma_v1_';
@@ -138,6 +216,9 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as FinanceStateSnapshot;
+        parsed.wallets = parsed.wallets.map(normalizeWalletRow);
+        parsed.transactions = parsed.transactions.map(normalizeTransactionRow);
+        parsed.todos = parsed.todos.map(normalizeTodoRow);
         parsed.dailySummaries = buildDailySummariesFromTransactions(
           telegram_id,
           parsed.transactions
@@ -162,12 +243,14 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       'Virtual Visa': 120000,
       'AYA Credit Card': 240000,
     };
+    const isDebt = name === 'AYA Credit Card';
     return {
       id: generateUUID(),
       telegram_id,
       name,
+      wallet_type: isDebt ? 'DEBT' : 'LIQUID',
       balance_mmk: defaultBalances[name] ?? 0,
-      is_credit: name === 'AYA Credit Card',
+      is_credit: isDebt,
       sort_order: idx,
     };
   });
@@ -178,6 +261,10 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       id: generateUUID(),
       telegram_id,
       tx_date: todayISO,
+      item_note: 'မနက်စာ မုန့်ဟင်းခါး နှင့် လက်ဖက်ရည်',
+      voice_input: 'မနက်စာ မုန့်ဟင်းခါး နှင့် လက်ဖက်ရည် ၆၅၀၀',
+      category: 'Food',
+      wallet_name: 'Cash',
       description: 'မနက်စာ မုန့်ဟင်းခါး နှင့် လက်ဖက်ရည်',
       type: 'expense',
       wallet: 'Cash',
@@ -188,7 +275,11 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       id: generateUUID(),
       telegram_id,
       tx_date: todayISO,
-      description: 'AYA Bank ကနေ KPay ကို လွှဲ (Debit)',
+      item_note: 'AYA Bank → KPay လွှဲပြောင်းငွေ',
+      voice_input: 'AYA Bank ကနေ KPay ကို ၁သိန်း လွှဲ',
+      category: 'Transfer_Out:KPay',
+      wallet_name: 'AYA Bank',
+      description: 'AYA Bank → KPay လွှဲပြောင်းငွေ',
       type: 'transfer',
       wallet: 'AYA Bank',
       amount_mmk: -100000,
@@ -199,7 +290,11 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       id: generateUUID(),
       telegram_id,
       tx_date: todayISO,
-      description: 'AYA Bank ကနေ KPay ကို လွှဲ (Credit)',
+      item_note: 'AYA Bank → KPay လက်ခံငွေ',
+      voice_input: 'AYA Bank ကနေ KPay ကို ၁သိန်း လွှဲ',
+      category: 'Transfer_In:AYA Bank',
+      wallet_name: 'KPay',
+      description: 'AYA Bank → KPay လက်ခံငွေ',
       type: 'transfer',
       wallet: 'KPay',
       amount_mmk: 100000,
@@ -210,6 +305,10 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       id: generateUUID(),
       telegram_id,
       tx_date: yesterdayISO,
+      item_note: 'လစာ ၁၄သိန်း ရပြီ',
+      voice_input: 'လစာ ၁၄သိန်း ရပြီ',
+      category: 'Income',
+      wallet_name: 'AYA Bank',
       description: 'လစာ ၁၄သိန်း ရပြီ',
       type: 'income',
       wallet: 'AYA Bank',
@@ -220,6 +319,10 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       id: generateUUID(),
       telegram_id,
       tx_date: yesterdayISO,
+      item_note: 'ညစာ ထမင်းဖိုး (KPay)',
+      voice_input: 'ညစာ ထမင်းဖိုး ၁၈၀၀၀ KPay',
+      category: 'Food',
+      wallet_name: 'KPay',
       description: 'ညစာ ထမင်းဖိုး (KPay)',
       type: 'expense',
       wallet: 'KPay',
@@ -235,6 +338,7 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       title: 'အိမ်လခ နှင့် မီတာခ (Rent & Utilities)',
       target_mmk: 350000,
       done_mmk: 350000,
+      month_cycle: currentMonth,
       month_label: currentMonth,
       is_archived: false,
       created_at: new Date().toISOString(),
@@ -245,6 +349,7 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       title: 'မိဘထောက်ပံ့ငွေ (Parents Support)',
       target_mmk: 200000,
       done_mmk: 100000,
+      month_cycle: currentMonth,
       month_label: currentMonth,
       is_archived: false,
       created_at: new Date().toISOString(),
@@ -255,6 +360,7 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       title: 'AYA Credit Card အကြွေးဆပ်ရန်',
       target_mmk: 240000,
       done_mmk: 0,
+      month_cycle: currentMonth,
       month_label: currentMonth,
       is_archived: false,
       created_at: new Date().toISOString(),
@@ -265,6 +371,7 @@ function getLocalStore(telegram_id: number, first_name: string): FinanceStateSna
       title: 'အင်တာနက် Fiber Bill (ပြီးခဲ့သောလ)',
       target_mmk: 65000,
       done_mmk: 65000,
+      month_cycle: '2026-09',
       month_label: '2026-09',
       is_archived: true,
       created_at: new Date(Date.now() - 86400 * 1000 * 30).toISOString(),
@@ -313,6 +420,7 @@ export function buildDailySummariesFromTransactions(
       rec = {
         telegram_id,
         tx_date: dateKey,
+        total_amount_mmk: 0,
         net_total_mmk: 0,
         pure_spent_mmk: 0,
         total_income_mmk: 0,
@@ -323,6 +431,7 @@ export function buildDailySummariesFromTransactions(
 
     const amt = Number(tx.amount_mmk || 0);
     rec.net_total_mmk += amt;
+    rec.total_amount_mmk = rec.net_total_mmk;
     if (tx.type === 'expense' || tx.type === 'todo_pay') {
       rec.pure_spent_mmk += Math.abs(amt);
     } else if (tx.type === 'income') {
@@ -347,29 +456,34 @@ export async function fetchFinanceSnapshot(
   }
 
   try {
-    // 1. Ensure user_settings row exists
-    const { data: existingSettings } = await supabase
-      .from('user_settings')
+    // 1. Ensure `users` row exists
+    const { data: existingUser } = await supabase
+      .from('users')
       .select('*')
       .eq('telegram_id', telegram_id)
       .maybeSingle();
 
     let settings: UserSettings;
-    if (!existingSettings) {
+    if (!existingUser) {
       const defaultSettings: UserSettings = {
         telegram_id,
         first_name,
         next_payday: getDefaultNextPayday(),
         gemini_api_key: null,
       };
-      const { data: insertedSettings } = await supabase
-        .from('user_settings')
-        .upsert(defaultSettings)
+      const { data: insertedUser } = await supabase
+        .from('users')
+        .upsert(defaultSettings, { onConflict: 'telegram_id' })
         .select('*')
         .single();
-      settings = (insertedSettings as UserSettings) ?? defaultSettings;
+      settings = (insertedUser as UserSettings) ?? defaultSettings;
     } else {
-      settings = existingSettings as UserSettings;
+      settings = {
+        telegram_id: Number(existingUser.telegram_id),
+        first_name: existingUser.first_name || first_name,
+        next_payday: existingUser.next_payday || getDefaultNextPayday(),
+        gemini_api_key: existingUser.gemini_api_key ?? null,
+      };
     }
 
     // 2. Fetch or seed 6 default wallets
@@ -379,13 +493,13 @@ export async function fetchFinanceSnapshot(
       .eq('telegram_id', telegram_id)
       .order('sort_order', { ascending: true });
 
-    let wallets: WalletRecord[] = (existingWallets as WalletRecord[]) ?? [];
+    let wallets: WalletRecord[] = (existingWallets ?? []).map(normalizeWalletRow);
     if (wallets.length === 0) {
       const seedWallets = DEFAULT_WALLETS.map((name, idx) => ({
         telegram_id,
         name,
+        wallet_type: name === 'AYA Credit Card' ? 'DEBT' : 'LIQUID',
         balance_mmk: 0,
-        is_credit: name === 'AYA Credit Card',
         sort_order: idx,
       }));
       const { data: insertedWallets } = await supabase
@@ -393,7 +507,7 @@ export async function fetchFinanceSnapshot(
         .upsert(seedWallets, { onConflict: 'telegram_id,name' })
         .select('*')
         .order('sort_order', { ascending: true });
-      wallets = (insertedWallets as WalletRecord[]) ?? [];
+      wallets = (insertedWallets ?? []).map(normalizeWalletRow);
     }
 
     // 3. Fetch transactions
@@ -404,7 +518,7 @@ export async function fetchFinanceSnapshot(
       .order('tx_date', { ascending: false })
       .order('created_at', { ascending: false })
       .limit(200);
-    const transactions: TransactionRecord[] = (txData as TransactionRecord[]) ?? [];
+    const transactions: TransactionRecord[] = (txData ?? []).map(normalizeTransactionRow);
 
     // 4. Fetch from `daily_summary` view
     const { data: summaryData } = await supabase
@@ -413,10 +527,26 @@ export async function fetchFinanceSnapshot(
       .eq('telegram_id', telegram_id)
       .order('tx_date', { ascending: false })
       .limit(60);
+
+    const computedByDate = buildDailySummariesFromTransactions(telegram_id, transactions);
     const dailySummaries: DailySummaryRecord[] =
       summaryData && summaryData.length > 0
-        ? (summaryData as DailySummaryRecord[])
-        : buildDailySummariesFromTransactions(telegram_id, transactions);
+        ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          summaryData.map((row: any) => {
+            const net = Number(row.total_amount_mmk ?? row.net_total_mmk ?? 0);
+            const fallbackTxCount =
+              computedByDate.find((c) => c.tx_date === row.tx_date)?.tx_count ?? 1;
+            return {
+              telegram_id: Number(row.telegram_id),
+              tx_date: row.tx_date,
+              total_amount_mmk: net,
+              net_total_mmk: net,
+              pure_spent_mmk: Number(row.pure_spent_mmk ?? 0),
+              total_income_mmk: Number(row.total_income_mmk ?? 0),
+              tx_count: Number(row.tx_count ?? fallbackTxCount),
+            };
+          })
+        : computedByDate;
 
     // 5. Fetch monthly_todos
     const { data: todoData } = await supabase
@@ -424,7 +554,7 @@ export async function fetchFinanceSnapshot(
       .select('*')
       .eq('telegram_id', telegram_id)
       .order('created_at', { ascending: true });
-    const todos: MonthlyTodoRecord[] = (todoData as MonthlyTodoRecord[]) ?? [];
+    const todos: MonthlyTodoRecord[] = (todoData ?? []).map(normalizeTodoRow);
 
     return {
       settings,
@@ -469,6 +599,7 @@ export async function addOrRenameWallet(
 ): Promise<FinanceStateSnapshot> {
   const cleanName = options.name.trim();
   if (!cleanName) return fetchFinanceSnapshot(telegram_id, first_name);
+  const wallet_type = options.is_credit ? 'DEBT' : 'LIQUID';
 
   if (isSupabaseConfigured && supabase) {
     if (options.walletId) {
@@ -481,24 +612,24 @@ export async function addOrRenameWallet(
 
       await supabase
         .from('wallets')
-        .update({ name: cleanName, is_credit: Boolean(options.is_credit) })
+        .update({ name: cleanName, wallet_type })
         .eq('id', options.walletId)
         .eq('telegram_id', telegram_id);
 
       if (oldWallet?.name && oldWallet.name !== cleanName) {
         await supabase
           .from('transactions')
-          .update({ wallet: cleanName })
+          .update({ wallet_name: cleanName })
           .eq('telegram_id', telegram_id)
-          .eq('wallet', oldWallet.name);
+          .eq('wallet_name', oldWallet.name);
       }
     } else {
       await supabase.from('wallets').upsert(
         {
           telegram_id,
           name: cleanName,
+          wallet_type,
           balance_mmk: Math.round(options.balance_mmk ?? 0),
-          is_credit: Boolean(options.is_credit),
           sort_order: 10,
         },
         { onConflict: 'telegram_id,name' }
@@ -513,12 +644,17 @@ export async function addOrRenameWallet(
     const oldName = old?.name;
     store.wallets = store.wallets.map((w) =>
       w.id === options.walletId
-        ? { ...w, name: cleanName, is_credit: Boolean(options.is_credit ?? w.is_credit) }
+        ? {
+            ...w,
+            name: cleanName,
+            wallet_type,
+            is_credit: Boolean(options.is_credit ?? w.is_credit),
+          }
         : w
     );
     if (oldName && oldName !== cleanName) {
       store.transactions = store.transactions.map((tx) =>
-        tx.wallet === oldName ? { ...tx, wallet: cleanName } : tx
+        tx.wallet === oldName ? { ...tx, wallet: cleanName, wallet_name: cleanName } : tx
       );
     }
   } else {
@@ -526,6 +662,7 @@ export async function addOrRenameWallet(
       id: generateUUID(),
       telegram_id,
       name: cleanName,
+      wallet_type,
       balance_mmk: Math.round(options.balance_mmk ?? 0),
       is_credit: Boolean(options.is_credit),
       sort_order: store.wallets.length,
@@ -541,14 +678,14 @@ export async function updateUserSettings(
   updates: Partial<Pick<UserSettings, 'next_payday' | 'gemini_api_key'>>
 ): Promise<FinanceStateSnapshot> {
   if (isSupabaseConfigured && supabase) {
-    await supabase
-      .from('user_settings')
-      .upsert({
+    await supabase.from('users').upsert(
+      {
         telegram_id,
         first_name,
         ...updates,
-        updated_at: new Date().toISOString(),
-      });
+      },
+      { onConflict: 'telegram_id' }
+    );
     return fetchFinanceSnapshot(telegram_id, first_name);
   }
 
@@ -577,7 +714,7 @@ export async function undoTransaction(
         .eq('telegram_id', telegram_id)
         .eq('transfer_pair_id', tx.transfer_pair_id);
 
-      const rowsToUndo = (pairRows as TransactionRecord[]) ?? [tx];
+      const rowsToUndo = (pairRows ?? [tx]).map(normalizeTransactionRow);
       for (const row of rowsToUndo) {
         const { data: w } = await supabase
           .from('wallets')
@@ -613,20 +750,6 @@ export async function undoTransaction(
           .eq('id', w.id);
       }
 
-      if (tx.type === 'todo_pay' && tx.todo_id) {
-        const { data: todo } = await supabase
-          .from('monthly_todos')
-          .select('id, done_mmk')
-          .eq('id', tx.todo_id)
-          .maybeSingle();
-        if (todo) {
-          await supabase
-            .from('monthly_todos')
-            .update({ done_mmk: Math.max(0, Number(todo.done_mmk) - Math.abs(tx.amount_mmk)) })
-            .eq('id', todo.id);
-        }
-      }
-
       await supabase
         .from('transactions')
         .delete()
@@ -658,13 +781,6 @@ export async function undoTransaction(
         ? { ...w, balance_mmk: Number(w.balance_mmk) - Number(tx.amount_mmk) }
         : w
     );
-    if (tx.type === 'todo_pay' && tx.todo_id) {
-      store.todos = store.todos.map((t) =>
-        t.id === tx.todo_id
-          ? { ...t, done_mmk: Math.max(0, Number(t.done_mmk) - Math.abs(tx.amount_mmk)) }
-          : t
-      );
-    }
     store.transactions = store.transactions.filter((r) => r.id !== tx.id);
   }
 
@@ -678,14 +794,14 @@ export async function addMonthlyTodo(
   title: string,
   target_mmk: number
 ): Promise<FinanceStateSnapshot> {
-  const month_label = getMyanmarDateISO(0).slice(0, 7);
+  const month_cycle = getMyanmarDateISO(0).slice(0, 7);
   if (isSupabaseConfigured && supabase) {
     await supabase.from('monthly_todos').insert({
       telegram_id,
       title: title.trim(),
       target_mmk: Math.round(target_mmk),
       done_mmk: 0,
-      month_label,
+      month_cycle,
       is_archived: false,
     });
     return fetchFinanceSnapshot(telegram_id, first_name);
@@ -698,7 +814,8 @@ export async function addMonthlyTodo(
     title: title.trim(),
     target_mmk: Math.round(target_mmk),
     done_mmk: 0,
-    month_label,
+    month_cycle,
+    month_label: month_cycle,
     is_archived: false,
     created_at: new Date().toISOString(),
   });
@@ -734,11 +851,11 @@ export async function payMonthlyTodo(
       await supabase.from('transactions').insert({
         telegram_id,
         tx_date: todayISO,
-        description: `TODO ပေးချေမှု: ${todo.title}`,
-        type: 'todo_pay',
-        wallet: walletName,
+        item_note: `TODO ပေးချေမှု: ${todo.title}`,
+        voice_input: `TODO ပေးချေမှု: ${todo.title}`,
+        category: 'DebtPayoff',
+        wallet_name: walletName,
         amount_mmk: -amount,
-        todo_id: todoId,
       });
 
       const { data: wallet } = await supabase
@@ -770,6 +887,10 @@ export async function payMonthlyTodo(
       id: generateUUID(),
       telegram_id,
       tx_date: todayISO,
+      item_note: `TODO ပေးချေမှု: ${targetTodo.title}`,
+      voice_input: `TODO ပေးချေမှု: ${targetTodo.title}`,
+      category: 'DebtPayoff',
+      wallet_name: walletName,
       description: `TODO ပေးချေမှု: ${targetTodo.title}`,
       type: 'todo_pay',
       wallet: walletName,
@@ -787,7 +908,7 @@ export async function archiveAndStartNewMonth(
   first_name: string,
   cloneTemplatesForNewMonth = false
 ): Promise<FinanceStateSnapshot> {
-  const nextMonthLabel = getMyanmarDateISO(0).slice(0, 7);
+  const nextMonthCycle = getMyanmarDateISO(0).slice(0, 7);
 
   if (isSupabaseConfigured && supabase) {
     const { data: activeTodos } = await supabase
@@ -803,12 +924,13 @@ export async function archiveAndStartNewMonth(
       .eq('is_archived', false);
 
     if (cloneTemplatesForNewMonth && activeTodos && activeTodos.length > 0) {
-      const cloned = activeTodos.map((t: MonthlyTodoRecord) => ({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cloned = activeTodos.map((t: any) => ({
         telegram_id,
         title: t.title,
         target_mmk: t.target_mmk,
         done_mmk: 0,
-        month_label: nextMonthLabel,
+        month_cycle: nextMonthCycle,
         is_archived: false,
       }));
       await supabase.from('monthly_todos').insert(cloned);
@@ -831,7 +953,8 @@ export async function archiveAndStartNewMonth(
         title: t.title,
         target_mmk: t.target_mmk,
         done_mmk: 0,
-        month_label: nextMonthLabel,
+        month_cycle: nextMonthCycle,
+        month_label: nextMonthCycle,
         is_archived: false,
         created_at: new Date().toISOString(),
       });
@@ -927,7 +1050,7 @@ export async function executeBurmeseQuickLog(
         parsed.rawText.toLowerCase().includes(t.title.toLowerCase().split(' ')[0])
       ) ?? activeTodos[0];
 
-    if (matchedTodo && parsed.amount > 0) {
+    if (matchedTodo && parsed.amount >= 0) {
       if (isSupabaseConfigured && supabase) {
         await supabase
           .from('monthly_todos')
@@ -995,19 +1118,21 @@ export async function executeBurmeseQuickLog(
         {
           telegram_id,
           tx_date: todayISO,
-          description: `${fromWallet} → ${toWallet} လွှဲပြောင်းငွေ (${parsed.rawText})`,
-          type: 'transfer',
-          wallet: fromWallet,
+          item_note: `${fromWallet} → ${toWallet} လွှဲပြောင်းငွေ`,
+          voice_input: parsed.rawText,
+          category: `Transfer_Out:${toWallet}`,
           amount_mmk: -amount,
+          wallet_name: fromWallet,
           transfer_pair_id: transferPairId,
         },
         {
           telegram_id,
           tx_date: todayISO,
-          description: `${fromWallet} → ${toWallet} လက်ခံငွေ (${parsed.rawText})`,
-          type: 'transfer',
-          wallet: toWallet,
+          item_note: `${fromWallet} → ${toWallet} လက်ခံငွေ`,
+          voice_input: parsed.rawText,
+          category: `Transfer_In:${fromWallet}`,
           amount_mmk: amount,
+          wallet_name: toWallet,
           transfer_pair_id: transferPairId,
         },
       ]);
@@ -1048,7 +1173,11 @@ export async function executeBurmeseQuickLog(
         id: generateUUID(),
         telegram_id,
         tx_date: todayISO,
-        description: `${fromWallet} → ${toWallet} လွှဲပြောင်းငွေ (${parsed.rawText})`,
+        item_note: `${fromWallet} → ${toWallet} လွှဲပြောင်းငွေ`,
+        voice_input: parsed.rawText,
+        category: `Transfer_Out:${toWallet}`,
+        wallet_name: fromWallet,
+        description: `${fromWallet} → ${toWallet} လွှဲပြောင်းငွေ`,
         type: 'transfer',
         wallet: fromWallet,
         amount_mmk: -amount,
@@ -1059,7 +1188,11 @@ export async function executeBurmeseQuickLog(
         id: generateUUID(),
         telegram_id,
         tx_date: todayISO,
-        description: `${fromWallet} → ${toWallet} လက်ခံငွေ (${parsed.rawText})`,
+        item_note: `${fromWallet} → ${toWallet} လက်ခံငွေ`,
+        voice_input: parsed.rawText,
+        category: `Transfer_In:${fromWallet}`,
+        wallet_name: toWallet,
+        description: `${fromWallet} → ${toWallet} လက်ခံငွေ`,
         type: 'transfer',
         wallet: toWallet,
         amount_mmk: amount,
@@ -1098,9 +1231,10 @@ export async function executeBurmeseQuickLog(
     await supabase.from('transactions').insert({
       telegram_id,
       tx_date: todayISO,
-      description: parsed.rawText,
-      type: isIncome ? 'income' : 'expense',
-      wallet: walletName,
+      item_note: parsed.rawText,
+      voice_input: parsed.rawText,
+      category: isIncome ? 'Income' : parsed.category || 'Other',
+      wallet_name: walletName,
       amount_mmk: signedAmount,
     });
 
@@ -1136,6 +1270,10 @@ export async function executeBurmeseQuickLog(
     id: generateUUID(),
     telegram_id,
     tx_date: todayISO,
+    item_note: parsed.rawText,
+    voice_input: parsed.rawText,
+    category: isIncome ? 'Income' : parsed.category || 'Other',
+    wallet_name: walletName,
     description: parsed.rawText,
     type: isIncome ? 'income' : 'expense',
     wallet: walletName,
@@ -1161,4 +1299,3 @@ export async function executeBurmeseQuickLog(
     snapshot: { ...store },
   };
 }
-

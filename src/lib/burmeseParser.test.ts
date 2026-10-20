@@ -71,11 +71,13 @@ const exp1 = parseBurmeseFinanceInput('ထမင်းဖိုး ၁၀၀၀�
 assert.equal(exp1.type, 'expense');
 assert.equal(exp1.amount, 10000);
 assert.equal(exp1.wallet, 'KPay');
+assert.equal(exp1.category, 'Food');
 
 const exp2 = parseBurmeseFinanceInput('Shopping ၄သောင်းခွဲ AYA Credit Card');
 assert.equal(exp2.type, 'expense');
 assert.equal(exp2.amount, 45000);
 assert.equal(exp2.wallet, 'AYA Credit Card');
+assert.equal(exp2.category, 'Shopping');
 
 // 7. Test deterministic classification: date_summary
 const sumToday = parseBurmeseFinanceInput('ဒီနေ့ဘယ်လောက်သုံးထားလဲ');

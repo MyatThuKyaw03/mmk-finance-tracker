@@ -26,6 +26,7 @@ export interface ParsedBurmeseCommand {
   wallet: WalletName;
   fromWallet?: WalletName;
   toWallet?: WalletName;
+  category: string;
   description: string;
   rawText: string;
   normalizedText: string;
@@ -108,8 +109,6 @@ export function parseBurmeseAmount(input: string): number {
   });
 
   // 2. Half multipliers: သိန်းခွဲ = +50000, သောင်းခွဲ = +5000, ထောင်ခွဲ = +500
-  // Note: If preceded by a digit (e.g. "၂သိန်းခွဲ"), the digit + base unit ("၂သိန်း")
-  // adds 2 * 100000 and "သိန်းခွဲ" adds +50000 = 250000.
   if (working.includes('သိန်းခွဲ')) {
     matchedMultiplier = true;
     total += 50000;
@@ -145,11 +144,9 @@ export function parseBurmeseAmount(input: string): number {
     });
   }
 
-  // Handle trailing digits after a unit (e.g. "၁သိန်း ၅" where 5 means 50,000, or raw numbers if no multiplier matched)
   if (!matchedMultiplier) {
     const rawNumbers = working.match(/\d+(?:\.\d+)?/g);
     if (rawNumbers && rawNumbers.length > 0) {
-      // Pick the largest or last number representing the MMK amount
       const nums = rawNumbers.map((n) => Math.round(parseFloat(n)));
       total = Math.max(...nums);
     }
@@ -312,10 +309,36 @@ export function detectTransferWallets(
 }
 
 /**
+ * Infers an expense category from Burmese/English keywords.
+ */
+export function inferExpenseCategory(rawText: string): string {
+  const lower = rawText.toLowerCase();
+  if (
+    /ထမင်း|မုန့်|ကော်ဖီ|လက်ဖက်ရည်|မနက်စာ|နေ့လည်စာ|ညစာ|စား|ဟင်း|food|coffee|lunch|dinner|breakfast/.test(
+      lower
+    )
+  ) {
+    return 'Food';
+  }
+  if (/ကားခ|တက္ကစီ|ဆီဖိုး|လမ်းစရိတ်|grab|taxi|bus|transport|fuel/.test(lower)) {
+    return 'Transport';
+  }
+  if (/ဖုန်းဘေလ်|မီတာခ|အင်တာနက်|အိမ်လခ|ရေခွန်|bill|wifi|rent|electric/.test(lower)) {
+    return 'Bills';
+  }
+  if (/အဝတ်|ဖိနပ်|အိတ်|ဝယ်|shopping|clothes|shoes/.test(lower)) {
+    return 'Shopping';
+  }
+  if (/ဆေး|ဆေးခန်း|ကျန်းမာရေး|medicine|clinic|hospital/.test(lower)) {
+    return 'Health';
+  }
+  return 'Other';
+}
+
+/**
  * Returns YYYY-MM-DD in Myanmar Time (UTC+6:30) with an optional day offset.
  */
 export function getMyanmarDateISO(dayOffset = 0, referenceDate: Date = new Date()): string {
-  // Convert to UTC+6:30 (390 minutes ahead of UTC)
   const utcMs = referenceDate.getTime() + referenceDate.getTimezoneOffset() * 60000;
   const mmMs = utcMs + 390 * 60000 + dayOffset * 86400000;
   const mmDate = new Date(mmMs);
@@ -376,6 +399,7 @@ export function parseBurmeseFinanceInput(
       type: 'date_summary',
       amount: 0,
       wallet: primaryWallet,
+      category: 'Summary',
       description: isYesterday ? 'မနေ့က အသုံးစရိတ်စာရင်း' : 'ဒီနေ့ အသုံးစရိတ်စာရင်း',
       rawText: trimmed,
       normalizedText,
@@ -396,6 +420,7 @@ export function parseBurmeseFinanceInput(
       type: 'advice_only',
       amount,
       wallet: primaryWallet,
+      category: 'Advice',
       description: trimmed,
       rawText: trimmed,
       normalizedText,
@@ -420,6 +445,7 @@ export function parseBurmeseFinanceInput(
       type: 'todo_pay',
       amount,
       wallet: primaryWallet,
+      category: 'DebtPayoff',
       description: trimmed,
       rawText: trimmed,
       normalizedText,
@@ -440,6 +466,7 @@ export function parseBurmeseFinanceInput(
       type: 'todo_update',
       amount,
       wallet: primaryWallet,
+      category: 'TodoUpdate',
       description: trimmed,
       rawText: trimmed,
       normalizedText,
@@ -461,6 +488,7 @@ export function parseBurmeseFinanceInput(
       type: 'todo_add',
       amount,
       wallet: primaryWallet,
+      category: 'TodoAdd',
       description: trimmed,
       rawText: trimmed,
       normalizedText,
@@ -483,6 +511,7 @@ export function parseBurmeseFinanceInput(
       wallet: fromWallet,
       fromWallet,
       toWallet,
+      category: `Transfer:${fromWallet}->${toWallet}`,
       description: extractCleanDescription(trimmed, 'transfer'),
       rawText: trimmed,
       normalizedText,
@@ -504,6 +533,7 @@ export function parseBurmeseFinanceInput(
       type: 'income',
       amount,
       wallet: primaryWallet,
+      category: 'Income',
       description: extractCleanDescription(trimmed, 'income'),
       rawText: trimmed,
       normalizedText,
@@ -516,6 +546,7 @@ export function parseBurmeseFinanceInput(
       type: 'expense',
       amount,
       wallet: primaryWallet,
+      category: inferExpenseCategory(trimmed),
       description: extractCleanDescription(trimmed, 'expense'),
       rawText: trimmed,
       normalizedText,
@@ -526,6 +557,7 @@ export function parseBurmeseFinanceInput(
     type: 'advice_only',
     amount: 0,
     wallet: primaryWallet,
+    category: 'Advice',
     description: trimmed,
     rawText: trimmed,
     normalizedText,
